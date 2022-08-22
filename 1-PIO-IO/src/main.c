@@ -23,10 +23,11 @@
 /* defines                                                              */
 /************************************************************************/
 
-#define LED_PIO           
-#define LED_PIO_ID        
-#define LED_PIO_IDX       
-#define LED_PIO_IDX_MASK  
+#define LED_PIO           PIOC                 // periferico que controla o LED
+#define LED_PIO_ID        ID_PIOC              // ID do periférico PIOC (controla LED)
+#define LED_PIO_IDX       8                    // ID do LED no PIO
+#define LED_PIO_IDX_MASK  (1 << LED_PIO_IDX)   // Mascara para CONTROLARMOS o LED
+
 
 /************************************************************************/
 /* constants                                                            */
@@ -53,7 +54,18 @@ void init(void);
 // Função de inicialização do uC
 void init(void)
 {
-
+  // Initialize the board clock
+  sysclk_init();
+	
+  // Desativa WatchDog Timer
+  WDT->WDT_MR = WDT_MR_WDDIS;
+  
+  // Ativa o PIO na qual o LED foi conectado
+  // para que possamos controlar o LED.
+  pmc_enable_periph_clk(LED_PIO_ID);
+  
+  //Inicializa PC8 como saída
+  pio_set_output(LED_PIO, LED_PIO_IDX_MASK, 0, 0, 0);
 }
 
 /************************************************************************/
@@ -69,7 +81,10 @@ int main(void)
   // aplicacoes embarcadas não devem sair do while(1).
   while (1)
   {
-
+	 pio_set(LED_PIO, LED_PIO_IDX_MASK);      // Coloca 1 no pino LED
+	 delay_ms(200);                        // Delay por software de 200 ms
+	 pio_clear(LED_PIO, LED_PIO_IDX_MASK);    // Coloca 0 no pino do LED
+	 delay_ms(200);
   }
   return 0;
 }
