@@ -224,8 +224,8 @@ void main(void) {
 					break;
 				}
             }
-            for(int i=150;i>=0;i-=1){
-                gfx_mono_draw_rect(i, 20, 70, 15, GFX_PIXEL_CLR);        
+            for(int i=30;i>=0;i-=1){
+               gfx_mono_draw_rect(i*4, 20, 2, 10, GFX_PIXEL_CLR);   
             }
             
         } 
