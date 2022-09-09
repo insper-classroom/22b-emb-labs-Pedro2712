@@ -102,9 +102,8 @@ char str[128];
 void add_freq(void) {
 	but_flag = 1;
     if (pio_get(BUT1_PIO, PIO_INPUT, BUT1_IDX_MASK)) {
-        freq += 100;
+	    freq += 100;
     }
-    
 }
 
 void sub_freq(void) {
@@ -207,6 +206,14 @@ void main(void) {
     // super loop aplicacoes embarcadas no devem sair do while(1).
     while (1) {
         if (but_flag) {
+			delay_ms(1000);
+			if (!pio_get(BUT1_PIO, PIO_INPUT, BUT1_IDX_MASK)) {
+				if (freq > 100) {
+					freq -= 100;
+				}
+			} else {
+				freq += 100;
+			}
             for (int i = 0; i <= 30; i++) {
                 sprintf(str, "%d", freq);
                 gfx_mono_draw_string(str, 50, 2, &sysfont);
@@ -227,7 +234,7 @@ void main(void) {
             for(int i=30;i>=0;i-=1){
                gfx_mono_draw_rect(i*4, 20, 2, 10, GFX_PIXEL_CLR);   
             }
-            
+            add= 0;
         } 
         if (!but_flag) {
             pmc_sleep(SAM_PM_SMODE_SLEEP_WFI);
