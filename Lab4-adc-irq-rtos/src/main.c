@@ -43,13 +43,13 @@ typedef struct {
   uint value;
 } adcData;
 
-void moving_average(adcData v[], int n);
-void adc_task(void *pvParameters);
-void proc_task(void *pvParameters);
-
 /************************************************************************/
 /* prototypes local                                                     */
 /************************************************************************/
+
+void moving_average(adcData v[], int n);
+void adc_task(void *pvParameters);
+void proc_task(void *pvParameters);
 
 static void USART1_init(void);
 static void config_AFEC_pot(Afec *afec, uint32_t afec_id, uint32_t afec_channel,
