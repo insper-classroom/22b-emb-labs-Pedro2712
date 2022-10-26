@@ -1,0 +1,6 @@
+{
+    "files.associations": {
+        "ili9341.h": "c",
+        "lvgl.h": "c"
+    }
+}
