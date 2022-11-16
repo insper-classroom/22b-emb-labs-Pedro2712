@@ -11,6 +11,7 @@
 LV_FONT_DECLARE(dseg70);
 LV_FONT_DECLARE(dseg50);
 LV_FONT_DECLARE(dseg20);
+LV_FONT_DECLARE(clock);
 
 /************************************************************************/
 /* LCD / LVGL                                                           */
@@ -18,6 +19,17 @@ LV_FONT_DECLARE(dseg20);
 
 #define LV_HOR_RES_MAX          (320)
 #define LV_VER_RES_MAX          (240)
+#define SIMPLE_CLOCK "\xEF\x80\x97"
+
+#define AFEC_POT0 AFEC0
+#define AFEC_POT0_ID ID_AFEC0
+#define AFEC_POT0_CHANNEL 8 // Canal do pino PC31
+
+// LED ON/Off
+#define LEDOnOff_PIO PIOA
+#define LEDOnOff_PIO_ID ID_PIOA
+#define LEDOnOff_IDX 3
+#define LEDOnOff_IDX_MASK (1 << LEDOnOff_IDX)
 
 /*A static or global variable to store the buffers*/
 static lv_disp_draw_buf_t disp_buf;
@@ -28,6 +40,12 @@ static lv_disp_drv_t disp_drv;          /*A variable to hold the drivers. Must b
 static lv_indev_drv_t indev_drv;
 
 static lv_obj_t * labelBtn1;
+
+volatile int flag = 0;
+
+SemaphoreHandle_t xSemaphoreTIME;
+QueueHandle_t xQueueVAR;
+
 lv_obj_t * labelFloor;
 lv_obj_t * labelPONTO;
 lv_obj_t * labelCELSIUS;
@@ -35,6 +53,7 @@ lv_obj_t * labelTEMP;
 lv_obj_t * labelHORA;
 lv_obj_t * labelDOIS_PONTOS;
 lv_obj_t * labelMIN;
+lv_obj_t * labelCASINHA;
 
 typedef struct  {
   uint32_t year;
@@ -46,12 +65,6 @@ typedef struct  {
   uint32_t second;
 } calendar;
 
-
-typedef struct  {
-  int inteiro;
-  int digito;
-} temperatura;
-
 /************************************************************************/
 /* RTOS                                                                 */
 /************************************************************************/
@@ -59,12 +72,22 @@ typedef struct  {
 #define TASK_LCD_STACK_SIZE                (1024*6/sizeof(portSTACK_TYPE))
 #define TASK_LCD_STACK_PRIORITY            (tskIDLE_PRIORITY)
 
+#define TASK_TIME_STACK_SIZE                (1024*6/sizeof(portSTACK_TYPE))
+#define TASK_TIME_STACK_PRIORITY            (tskIDLE_PRIORITY)
+
+#define TASK_TEMP_VAR_STACK_SIZE                (1024*6/sizeof(portSTACK_TYPE))
+#define TASK_TEMP_VAR_STACK_PRIORITY            (tskIDLE_PRIORITY)
+
 extern void vApplicationStackOverflowHook(xTaskHandle *pxTask,  signed char *pcTaskName);
 extern void vApplicationIdleHook(void);
 extern void vApplicationTickHook(void);
 extern void vApplicationMallocFailedHook(void);
 extern void xPortSysTickHandler(void);
 void RTC_init(Rtc *rtc, uint32_t id_rtc, calendar t, uint32_t irq_type);
+static void config_AFEC_pot(Afec *afec, uint32_t afec_id, uint32_t afec_channel,
+                            afec_callback_t callback);
+static void RTT_init(float freqPrescale, uint32_t IrqNPulses, uint32_t rttIRQSource);
+static void light_init_(void);
 
 extern void vApplicationStackOverflowHook(xTaskHandle *pxTask, signed char *pcTaskName) {
 	printf("stack overflow %x %s\r\n", pxTask, (portCHAR *)pcTaskName);
@@ -99,7 +122,7 @@ static void event_handler_ONOFF(lv_event_t * e) {
 	lv_event_code_t code = lv_event_get_code(e);
 
 	if(code == LV_EVENT_CLICKED) {
-		LV_LOG_USER("Clicked");
+		pio_clear(LEDOnOff_PIO, LEDOnOff_IDX_MASK);
 	}
 	else if(code == LV_EVENT_VALUE_CHANGED) {
 		LV_LOG_USER("Toggled");
@@ -152,25 +175,13 @@ static void event_handler_TEMP_DOWN(lv_event_t * e) {
     }
 }
 
-void RTC_Handler(void) {
-    uint32_t ul_status = rtc_get_status(RTC);
-
-	uint32_t current_hour, current_min, current_sec;
-    uint32_t current_year, current_month, current_day, current_week;
-    rtc_get_time(RTC, &current_hour, &current_min, &current_sec);
-    rtc_get_date(RTC, &current_year, &current_month, &current_day, &current_week);
+void RTC_Handler(void) {	
+	uint32_t ul_status = rtc_get_status(RTC);
 	
     /* seccond tick */
     if ((ul_status & RTC_SR_SEC) == RTC_SR_SEC) {	
 	// o código para irq de segundo vem aqui
-		printf("segundo: %d\n", current_sec);
-		lv_label_set_text_fmt(labelHORA, "%02d", current_hour);
-		lv_label_set_text_fmt(labelMIN, "%02d", current_min);
-		if (current_sec % 2 == 0) {
-			lv_label_set_text(labelDOIS_PONTOS, ":");
-		} else {
-			lv_label_set_text(labelDOIS_PONTOS, " ");
-		}
+		xSemaphoreGiveFromISR(xSemaphoreTIME, 0);
 	}
 	
     /* Time or date alarm */
@@ -184,6 +195,58 @@ void RTC_Handler(void) {
     rtc_clear_status(RTC, RTC_SCCR_TIMCLR);
     rtc_clear_status(RTC, RTC_SCCR_CALCLR);
     rtc_clear_status(RTC, RTC_SCCR_TDERRCLR);
+}
+
+void task_time(void) {
+	while (1) {
+		if( xSemaphoreTake(xSemaphoreTIME, 0)){
+			uint32_t current_hour, current_min, current_sec;
+			uint32_t current_year, current_month, current_day, current_week;
+			rtc_get_time(RTC, &current_hour, &current_min, &current_sec);
+			rtc_get_date(RTC, &current_year, &current_month, &current_day, &current_week);
+			
+			lv_label_set_text_fmt(labelHORA, "%02d", current_hour);
+			lv_label_set_text_fmt(labelMIN, "%02d", current_min);
+			if (current_sec % 2 == 0) {
+				lv_label_set_text(labelDOIS_PONTOS, ":");
+			} else {
+				lv_label_set_text(labelDOIS_PONTOS, " ");
+			}
+      	}
+	}
+	
+}
+
+static void AFEC_pot0_callback(void) {
+    int value = afec_channel_get_value(AFEC_POT0, AFEC_POT0_CHANNEL);
+    BaseType_t xHigherPriorityTaskWoken = pdTRUE;
+    xQueueSendFromISR(xQueueVAR, &value, &xHigherPriorityTaskWoken);
+}
+
+void RTT_Handler(void) {
+    uint32_t ul_status;
+    ul_status = rtt_get_status(RTT);
+
+    /* IRQ due to Alarm */
+    if ((ul_status & RTT_SR_ALMS) == RTT_SR_ALMS) {
+        afec_channel_enable(AFEC_POT0, AFEC_POT0_CHANNEL);
+  		afec_start_software_conversion(AFEC_POT0);
+    }
+}
+
+static void task_temp_var(void *pvParameters) {
+  // configura ADC e TC para controlar a leitura
+  config_AFEC_pot(AFEC_POT0, AFEC_POT0_ID, AFEC_POT0_CHANNEL, AFEC_pot0_callback);
+
+  // variável para recever dados da fila
+  int var;
+  while (1) {
+  	RTT_init(1000, 100, RTT_MR_ALMIEN);
+    if (xQueueReceive(xQueueVAR, &(var), 1000)) {
+		int temp = (var * 100) / 4096;
+		lv_label_set_text_fmt(labelTEMP, "%02d", temp);
+	}
+  }
 }
 
 void lv_termostato(void) {
@@ -220,7 +283,8 @@ void lv_termostato(void) {
 	lv_obj_add_style(btn3, &style, 0);
 
 	lv_obj_t * labelbnt3 = lv_label_create(btn3);
-	lv_label_set_text(labelbnt3, LV_SYMBOL_SETTINGS "  ]");
+	lv_obj_set_style_text_font(labelbnt3, &clock, LV_STATE_DEFAULT);
+	lv_label_set_text(labelbnt3, SIMPLE_CLOCK "  ]");
 	lv_obj_center(labelbnt3);
 
 	// seta a temperatura cima
@@ -240,31 +304,15 @@ void lv_termostato(void) {
 	lv_obj_add_style(bnt5, &style, 0);
 	
 	lv_obj_t * labelbnt5 = lv_label_create(bnt5);
-	lv_label_set_text(labelbnt5, LV_SYMBOL_DOWN "  ]");
+	lv_label_set_text(labelbnt5, LV_SYMBOL_DOWN);
 	lv_obj_center(labelbnt5);
-
-	temperatura temp_inicial = { 23, 4 };
 	
 	// Label Floor
 	labelFloor = lv_label_create(lv_scr_act());
     lv_obj_align(labelFloor, LV_ALIGN_LEFT_MID, 30, -30);
     lv_obj_set_style_text_font(labelFloor, &dseg70, LV_STATE_DEFAULT);
     lv_obj_set_style_text_color(labelFloor, lv_color_white(), LV_STATE_DEFAULT);
-    lv_label_set_text_fmt(labelFloor, "%02d", 22);
-
-	// // label .
-	// labelPONTO = lv_label_create(lv_scr_act());
-	// lv_obj_align_to(labelPONTO, labelFloor, LV_ALIGN_OUT_RIGHT_TOP, 0, 0);
-	// lv_obj_set_style_text_font(labelPONTO, &dseg50, LV_STATE_DEFAULT);
-	// lv_obj_set_style_text_color(labelPONTO, lv_color_white(), LV_STATE_DEFAULT);
-	// lv_label_set_text(labelPONTO, ".");
-
-	// // label celsius
-	// labelCELSIUS = lv_label_create(lv_scr_act());
-	// lv_obj_align_to(labelCELSIUS, labelFloor, LV_ALIGN_OUT_RIGHT_BOTTOM, 0, 0);
-	// lv_obj_set_style_text_font(labelCELSIUS, &dseg20, LV_STATE_DEFAULT);
-	// lv_obj_set_style_text_color(labelCELSIUS, lv_color_white(), LV_STATE_DEFAULT);
-	// lv_label_set_text_fmt(labelFloor, "%01d", 4);
+    lv_label_set_text_fmt(labelFloor, "%.1f", 22.44);
 
 	// Label TEMP
 	labelTEMP = lv_label_create(lv_scr_act());
@@ -302,6 +350,15 @@ void lv_termostato(void) {
 	lv_obj_set_style_text_font(labelMIN, &dseg20, LV_STATE_DEFAULT);
 	lv_obj_set_style_text_color(labelMIN, lv_color_white(), LV_STATE_DEFAULT);
 	lv_label_set_text_fmt(labelMIN, "%02d", current_min);
+
+	// Label casinha
+	labelCASINHA = lv_label_create(lv_scr_act());
+	lv_obj_align(labelCASINHA, LV_ALIGN_BOTTOM_LEFT, 100, -50);
+
+	lv_obj_t * labelCASA = lv_label_create(labelCASINHA);
+	lv_label_set_text(labelCASA, LV_SYMBOL_HOME);
+	lv_obj_center(labelCASA);
+
 }
 
 /************************************************************************/
@@ -313,6 +370,7 @@ static void task_lcd(void *pvParameters) {
 
 	// lv_ex_btn_1();
 	lv_termostato();
+	lv_obj_clear_flag(lv_scr_act(), LV_OBJ_FLAG_SCROLLABLE);
 
 	for (;;)  {
 		// alarme(1);
@@ -325,6 +383,59 @@ static void task_lcd(void *pvParameters) {
 /************************************************************************/
 /* configs                                                              */
 /************************************************************************/
+
+static void light_init_(void) {
+    // Ativa PIOs
+    pmc_enable_periph_clk(LEDOnOff_PIO_ID);
+
+    // Configura Pinos
+    pio_configure(LEDOnOff_PIO, PIO_OUTPUT_1, LEDOnOff_IDX_MASK, PIO_DEFAULT | PIO_DEBOUNCE);
+}
+
+static void config_AFEC_pot(Afec *afec, uint32_t afec_id, uint32_t afec_channel,
+                            afec_callback_t callback) {
+    /*************************************
+     * Ativa e configura AFEC
+     *************************************/
+    /* Ativa AFEC - 0 */
+    afec_enable(afec);
+
+    /* struct de configuracao do AFEC */
+    struct afec_config afec_cfg;
+
+    /* Carrega parametros padrao */
+    afec_get_config_defaults(&afec_cfg);
+
+    /* Configura AFEC */
+    afec_init(afec, &afec_cfg);
+
+    /* Configura trigger por software */
+    afec_set_trigger(afec, AFEC_TRIG_SW);
+
+    /*** Configuracao específica do canal AFEC ***/
+    struct afec_ch_config afec_ch_cfg;
+    afec_ch_get_config_defaults(&afec_ch_cfg);
+    afec_ch_cfg.gain = AFEC_GAINVALUE_0;
+    afec_ch_set_config(afec, afec_channel, &afec_ch_cfg);
+
+    /*
+    * Calibracao:
+    * Because the internal ADC offset is 0x200, it should cancel it and shift
+    down to 0.
+    */
+    afec_channel_set_analog_offset(afec, afec_channel, 0x200);
+
+    /***  Configura sensor de temperatura ***/
+    struct afec_temp_sensor_config afec_temp_sensor_cfg;
+
+    afec_temp_sensor_get_config_defaults(&afec_temp_sensor_cfg);
+    afec_temp_sensor_set_config(afec, &afec_temp_sensor_cfg);
+
+    /* configura IRQ */
+    afec_set_callback(afec, afec_channel, callback, 1);
+    NVIC_SetPriority(afec_id, 4);
+    NVIC_EnableIRQ(afec_id);
+}
 
 void RTC_init(Rtc *rtc, uint32_t id_rtc, calendar t, uint32_t irq_type) {
 	/* Configura o PMC */
@@ -375,6 +486,36 @@ static void configure_console(void) {
 	setbuf(stdout, NULL);
 }
 
+static void RTT_init(float freqPrescale, uint32_t IrqNPulses,
+uint32_t rttIRQSource) {
+
+	uint16_t pllPreScale = (int)(((float)32768) / freqPrescale);
+
+	rtt_sel_source(RTT, false);
+	rtt_init(RTT, pllPreScale);
+
+	if (rttIRQSource & RTT_MR_ALMIEN) {
+		uint32_t ul_previous_time;
+		ul_previous_time = rtt_read_timer_value(RTT);
+		while (ul_previous_time == rtt_read_timer_value(RTT))
+		;
+		rtt_write_alarm_time(RTT, IrqNPulses + ul_previous_time);
+	}
+
+	/* config NVIC */
+	NVIC_DisableIRQ(RTT_IRQn);
+	NVIC_ClearPendingIRQ(RTT_IRQn);
+	NVIC_SetPriority(RTT_IRQn, 4);
+	NVIC_EnableIRQ(RTT_IRQn);
+
+	/* Enable RTT interrupt */
+	if (rttIRQSource & (RTT_MR_RTTINCIEN | RTT_MR_ALMIEN))
+	rtt_enable_interrupt(RTT, rttIRQSource);
+	else
+	rtt_disable_interrupt(RTT, RTT_MR_RTTINCIEN | RTT_MR_ALMIEN);
+}
+
+
 /************************************************************************/
 /* port lvgl                                                            */
 /************************************************************************/
@@ -391,10 +532,22 @@ void my_flush_cb(lv_disp_drv_t * disp_drv, const lv_area_t * area, lv_color_t * 
 void my_input_read(lv_indev_drv_t * drv, lv_indev_data_t*data) {
 	int px, py, pressed;
 	
-	if (readPoint(&px, &py))
+	if (readPoint(&px, &py)){
 		data->state = LV_INDEV_STATE_PRESSED;
-	else
-		data->state = LV_INDEV_STATE_RELEASED; 
+		printf("FLAG: %d\n", flag);
+		if (!pio_get(LEDOnOff_PIO, PIO_INPUT, LEDOnOff_IDX_MASK) && flag == 5){
+			pio_set(LEDOnOff_PIO, LEDOnOff_IDX_MASK);
+		}
+		flag += 1;
+		if (flag > 5) 
+			flag = 5;
+	} else {
+		data->state = LV_INDEV_STATE_RELEASED;
+		printf("FLAG: %d\n", flag);
+		flag -= 1;
+		if (flag < -5) 
+			flag = -5;
+	}
 	
 	data->point.x = px;
 	data->point.y = py;
@@ -428,15 +581,34 @@ int main(void) {
 	board_init();
 	sysclk_init();
 	configure_console();
+	light_init_();
 
 	/* LCd, touch and lvgl init*/
 	configure_lcd();
 	configure_touch();
 	configure_lvgl();
 
+	xSemaphoreTIME = xSemaphoreCreateBinary();
+
+	xQueueVAR = xQueueCreate(32, sizeof(int) );
+	
+	ili9341_backlight_off();
+	
+	// verifica se semáforo foi criado corretamente
+	if (xSemaphoreTIME == NULL)
+		printf("falha em criar o semaforo \n");
+
 	/* Create task to control oled */
 	if (xTaskCreate(task_lcd, "LCD", TASK_LCD_STACK_SIZE, NULL, TASK_LCD_STACK_PRIORITY, NULL) != pdPASS) {
 		printf("Failed to create lcd task\r\n");
+	}
+
+	if (xTaskCreate(task_time, "TIME", TASK_TIME_STACK_SIZE, NULL, TASK_TIME_STACK_PRIORITY, NULL) != pdPASS) {
+		printf("Failed to create time task\r\n");
+	}
+
+	if (xTaskCreate(task_temp_var, "TEMP_VAR", TASK_TEMP_VAR_STACK_SIZE, NULL, TASK_TEMP_VAR_STACK_PRIORITY, NULL) != pdPASS) {
+		printf("Failed to create temp var task\r\n");
 	}
 	
 	/* Start the scheduler. */
